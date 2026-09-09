@@ -53,7 +53,13 @@ The CineCircle integration adds a narrow request-indexing path for request
 sources that already provide a stable TMDb ID. Upstream request flows can
 otherwise depend on a Trakt-to-IMDb conversion before Riven can index media.
 That is unsuitable for this deployment because the request source already
-knows the TMDb identity and Trakt is not required for this purpose.
+knows the TMDb identity and Trakt should not be a required dependency.
+
+In July 2026, Trakt introduced a free-account limit of one connected
+third-party “Community App”. CineCircle therefore cannot assume that a user
+has an available Trakt authorization slot for Riven; an existing connection
+can continue, but authorizing another app is subject to that limit. See
+[Trakt's official Community App announcement](https://forums.trakt.tv/t/an-update-to-community-app-connections/117898).
 
 The local `TmdbRequestIndexer` therefore:
 
@@ -69,7 +75,7 @@ The local `TmdbRequestIndexer` therefore:
 
 The internal IDs named `tmdb_<id>` are namespaced placeholders required by
 Riven's data model. They are **not** Trakt IDs and do not create a Trakt API
-dependency or write data to Trakt.
+dependency, consume a Trakt Community App connection, or write data to Trakt.
 
 This path requires Riven's normal `TMDB_READ_ACCESS_TOKEN`. Do not put that
 token, debrid credentials, Plex/Jellyfin tokens, or any production settings in
