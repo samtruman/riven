@@ -52,18 +52,23 @@ branch or a replacement for Riven's normal architecture.
 The CineCircle integration adds a narrow request-indexing path for requests
 that already provide a stable TMDb ID. In this deployment, requests created
 from the Riven interface already carry that ID, while upstream `main` has no
-corresponding direct TMDb request indexer. The usual upstream alternative is
-to configure a content integration such as Trakt to create compatible items.
+corresponding direct TMDb request indexer.
 
-That alternative is optional, but it requires configuring Riven's Trakt
-content settings with a Trakt API key. Monitoring a user's Trakt watchlist
-also requires that app's OAuth client ID, client secret, redirect URI, and
-the user's OAuth access/refresh tokens. CineCircle does not need those
-credentials because the request already knows the TMDb identity.
+This is separate from Riven's optional **Content → Trakt** service. More
+importantly, upstream's normal `TMDBIndexer` constructs `TraktAPI` and calls
+Trakt for aliases while indexing TMDb media. That client sends a
+`trakt-api-key` header from `TRAKT_API_CLIENT_ID`, or from an embedded fallback
+client ID. A valid Trakt client ID is therefore an implicit dependency of that
+upstream indexing path even though it is not presented as a required setting
+in the UI or general documentation.
+
+The local `TmdbRequestIndexer` queries TMDb directly and does not instantiate
+`TraktAPI`. It removes that hidden Trakt-client prerequisite for CineCircle
+requests because the request already knows the TMDb identity.
 
 In July 2026, Trakt introduced a free-account limit of one connected
 third-party “Community App”. This is an additional reason not to make Trakt a
-mandatory workaround: CineCircle cannot assume that a user has an available
+mandatory dependency: CineCircle cannot assume that a user has an available
 Trakt authorization slot for Riven. An existing connection can continue, but
 authorizing another app is subject to that limit. See
 [Trakt's official Community App announcement](https://forums.trakt.tv/t/an-update-to-community-app-connections/117898).
