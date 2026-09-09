@@ -38,8 +38,58 @@ We are constantly adding features and improvements as we go along and squashing 
 
 ---
 
+## CineCircle fork notes
+
+This is the CineCircle fork of [upstream Riven](https://github.com/rivenmedia/riven).
+The default `main` branch stays close to upstream and documents the fork. The
+operational local integration is kept separately on
+[`fork/cinecircle/runtime-integration`](https://github.com/samtruman/riven/tree/fork/cinecircle/runtime-integration).
+It is intentionally a deployment branch, not an upstream-compatible feature
+branch or a replacement for Riven's normal architecture.
+
+### TMDb-first requests
+
+The CineCircle integration adds a narrow request-indexing path for request
+sources that already provide a stable TMDb ID. Upstream request flows can
+otherwise depend on a Trakt-to-IMDb conversion before Riven can index media.
+That is unsuitable for this deployment because the request source already
+knows the TMDb identity and Trakt is not required for this purpose.
+
+The local `TmdbRequestIndexer` therefore:
+
+- resolves movies and TV shows directly through Riven's configured TMDb Read
+  Access Token;
+- preserves the supplied TMDb ID and retrieves IMDb only when TMDb exposes it;
+- creates normal Riven movie/show/season/episode objects, so downstream
+  scraper, downloader, ranking and symlink stages are unchanged;
+- preserves an explicit season or episode selection by pausing unrequested
+  children rather than downloading a whole show unintentionally;
+- falls back from an existing IMDb ID through TMDb's `/find` endpoint only
+  when a direct TMDb ID was not supplied.
+
+The internal IDs named `tmdb_<id>` are namespaced placeholders required by
+Riven's data model. They are **not** Trakt IDs and do not create a Trakt API
+dependency or write data to Trakt.
+
+This path requires Riven's normal `TMDB_READ_ACCESS_TOKEN`. Do not put that
+token, debrid credentials, Plex/Jellyfin tokens, or any production settings in
+this repository.
+
+### Scope and upstream relationship
+
+The CineCircle branch also contains deployment-specific integration work such
+as AllDebrid/DavDebrid hand-off behavior and local stream-selection policy.
+Those choices are not claimed to be generic Riven behavior. Upstream-quality
+changes should be isolated, tested against a clean upstream branch, and sent
+as small focused pull requests rather than by merging this deployment branch.
+
+---
+
 ## Table of Contents
 
+- [CineCircle fork notes](#cinecircle-fork-notes)
+  - [TMDb-first requests](#tmdb-first-requests)
+  - [Scope and upstream relationship](#scope-and-upstream-relationship)
 - [Self Hosted](#self-hosted)
   - [Installation](#installation)
   - [Plex](#plex)
