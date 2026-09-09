@@ -38,74 +38,57 @@ We are constantly adding features and improvements as we go along and squashing 
 
 ---
 
-## CineCircle fork notes
+## Fork notes
 
-This is the CineCircle fork of [upstream Riven](https://github.com/rivenmedia/riven).
-The default `main` branch stays close to upstream and documents the fork. The
-operational local integration is kept separately on
-[`fork/cinecircle/runtime-integration`](https://github.com/samtruman/riven/tree/fork/cinecircle/runtime-integration).
-It is intentionally a deployment branch, not an upstream-compatible feature
-branch or a replacement for Riven's normal architecture.
+This fork of [Riven](https://github.com/rivenmedia/riven) is used to develop
+and test focused changes for upstream contribution. The default `main`
+branch documents the fork; experimental implementation work is maintained
+separately and is not implied to be available on `main`.
 
 ### TMDb-first requests
 
-The CineCircle integration adds a narrow request-indexing path for requests
-that already provide a stable TMDb ID. In this deployment, requests created
-from the Riven interface already carry that ID, while upstream `main` has no
-corresponding direct TMDb request indexer.
+The request-indexing work resolves requests with a known TMDb ID directly
+through TMDb. Its purpose is to let Riven index these requests without
+requiring Trakt for metadata enrichment.
 
-This is separate from Riven's optional **Content → Trakt** service. More
-importantly, upstream's normal `TMDBIndexer` constructs `TraktAPI` and calls
-Trakt for aliases while indexing TMDb media. That client sends a
-`trakt-api-key` header from `TRAKT_API_CLIENT_ID`, or from an embedded fallback
-client ID. A valid Trakt client ID is therefore an implicit dependency of that
-upstream indexing path even though it is not presented as a required setting
-in the UI or general documentation.
+Riven's optional **Content → Trakt** service imports content from Trakt.
+The metadata dependency is separate: the upstream indexing implementation
+examined for this work constructs `TraktAPI` to retrieve aliases, using a
+`trakt-api-key` header supplied by `TRAKT_API_CLIENT_ID` or an embedded
+fallback client ID. Disabling the content service does not remove that
+metadata dependency.
 
-The local `TmdbRequestIndexer` queries TMDb directly and does not instantiate
-`TraktAPI`. It removes that hidden Trakt-client prerequisite for CineCircle
-requests because the request already knows the TMDb identity.
+The experimental `TmdbRequestIndexer` queries TMDb directly without
+instantiating `TraktAPI`. It:
 
-In July 2026, Trakt introduced a free-account limit of one connected
-third-party “Community App”. This is an additional reason not to make Trakt a
-mandatory dependency: CineCircle cannot assume that a user has an available
-Trakt authorization slot for Riven. An existing connection can continue, but
-authorizing another app is subject to that limit. See
-[Trakt's official Community App announcement](https://forums.trakt.tv/t/an-update-to-community-app-connections/117898).
+- resolves movies and TV shows using Riven's configured TMDb Read Access Token;
+- preserves the supplied TMDb ID and retrieves IMDb IDs when available;
+- creates Riven movie, show, season and episode objects for the existing
+  scraper, downloader, ranking and library stages;
+- preserves explicit season or episode selections by pausing unrequested
+  children;
+- supports resolving an IMDb ID through TMDb's `/find` endpoint when a
+  direct TMDb ID is unavailable.
 
-The local `TmdbRequestIndexer` therefore:
+The experimental implementation uses namespaced `tmdb_<id>` placeholders
+where its target data model requires them. These are not Trakt IDs and must
+not be sent to Trakt endpoints.
 
-- resolves movies and TV shows directly through Riven's configured TMDb Read
-  Access Token;
-- preserves the supplied TMDb ID and retrieves IMDb only when TMDb exposes it;
-- creates normal Riven movie/show/season/episode objects, so downstream
-  scraper, downloader, ranking and symlink stages are unchanged;
-- preserves an explicit season or episode selection by pausing unrequested
-  children rather than downloading a whole show unintentionally;
-- falls back from an existing IMDb ID through TMDb's `/find` endpoint only
-  when a direct TMDb ID was not supplied.
-
-The internal IDs named `tmdb_<id>` are namespaced placeholders required by
-Riven's data model. They are **not** Trakt IDs and do not create a Trakt API
-dependency, consume a Trakt Community App connection, or write data to Trakt.
-
-This path requires Riven's normal `TMDB_READ_ACCESS_TOKEN`. Do not put that
-token, debrid credentials, Plex/Jellyfin tokens, or any production settings in
-this repository.
+This path requires `TMDB_READ_ACCESS_TOKEN`. API tokens and production
+settings must remain outside the repository.
 
 ### Scope and upstream relationship
 
-The CineCircle branch also contains deployment-specific integration work such
-as AllDebrid/DavDebrid hand-off behavior and local stream-selection policy.
-Those choices are not claimed to be generic Riven behavior. Upstream-quality
-changes should be isolated, tested against a clean upstream branch, and sent
-as small focused pull requests rather than by merging this deployment branch.
+The planned upstream contribution is limited to removing the Trakt
+dependency from TMDb request indexing. It must be adapted and tested against
+a clean upstream branch. Deployment integrations and stream-ranking changes
+are separate work and are outside that pull request.
 
 ---
 
 ## Table of Contents
 
-- [CineCircle fork notes](#cinecircle-fork-notes)
+- [Fork notes](#fork-notes)
   - [TMDb-first requests](#tmdb-first-requests)
   - [Scope and upstream relationship](#scope-and-upstream-relationship)
 - [Self Hosted](#self-hosted)
