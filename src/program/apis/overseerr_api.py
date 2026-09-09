@@ -1,21 +1,33 @@
-﻿"""Overseerr API client"""
+﻿from typing import Union
 
-from typing import TYPE_CHECKING, Literal
-
+from kink import di
 from loguru import logger
 from requests.exceptions import ConnectionError, RetryError
-from urllib3.exceptions import MaxRetryError, NewConnectionError
+from urllib3.exceptions import MaxRetryError
 
-from program.utils.request import SmartSession, get_hostname_from_url
-
-if TYPE_CHECKING:
-    from program.media.item import MediaItem
-
-type ItemType = Literal["tv", "movie"]
+from program.apis.trakt_api import TraktAPI
+from program.media.item import MediaItem
+from program.settings.manager import settings_manager
+from program.utils.request import (
+    BaseRequestHandler,
+    HttpMethod,
+    ResponseObject,
+    ResponseType,
+    Session,
+    create_service_session,
+    get_rate_limit_params,
+)
 
 
 class OverseerrAPIError(Exception):
     """Base exception for OverseerrAPI related errors"""
+
+class OverseerrRequestHandler(BaseRequestHandler):
+    def __init__(self, session: Session, base_url: str, request_logging: bool = False):
+        super().__init__(session, base_url=base_url, response_type=ResponseType.SIMPLE_NAMESPACE, custom_exception=OverseerrAPIError, request_logging=request_logging)
+
+    def execute(self, method: HttpMethod, endpoint: str, **kwargs) -> ResponseObject:
+        return super()._request(method, endpoint, **kwargs)
 
 
 class OverseerrAPI:
@@ -23,148 +35,144 @@ class OverseerrAPI:
 
     def __init__(self, api_key: str, base_url: str):
         self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
-
-        self.session = SmartSession(
-            base_url=base_url,
-            rate_limits={
-                # 1000 calls per 5 minutes, retries=3, backoff_factor=0.3
-                get_hostname_from_url(self.base_url): {
-                    "rate": 1000 / 300,
-                    "capacity": 1000,
-                }
-            },
-        )
-
-        self.session.headers.update(
-            {
-                "X-Api-Key": self.api_key,
-            }
-        )
+        rate_limit_params = get_rate_limit_params(max_calls=1000, period=300)
+        session = create_service_session(rate_limit_params=rate_limit_params)
+        self.trakt_api = di[TraktAPI]
+        self.headers = {"X-Api-Key": self.api_key}
+        session.headers.update(self.headers)
+        self.request_handler = OverseerrRequestHandler(session, base_url=base_url)
 
     def validate(self):
-        """Validate API connection"""
+        return self.request_handler.execute(HttpMethod.GET, "api/v1/auth/me", timeout=30)
 
-        try:
-            return self.session.get("api/v1/auth/me", timeout=15).ok
-        except (ConnectionError, RetryError, MaxRetryError, NewConnectionError):
-            logger.error("Overseerr URL is not reachable, or it timed out")
-        except Exception as e:
-            logger.error(f"Unexpected error during Overseerr validation: {str(e)}")
-
-        return False
-
-    def get_media_requests(
-        self,
-        service_key: str,
-        filter: (
-            Literal[
-                "all",
-                "approved",
-                "available",
-                "pending",
-                "processing",
-                "unavailable",
-                "failed",
-                "deleted",
-                "completed",
-            ]
-            | None
-        ) = "approved",
-        take: int = 10000,
-        filter_pending_items: bool = True,
-    ) -> list["MediaItem"]:
+    def get_media_requests(self, service_key: str) -> list[MediaItem]:
         """Get media requests from `Overseerr`"""
-
-        from program.media.item import MediaItem
-
-        url = f"api/v1/request?take={take}&sort=added"
-
-        if filter:
-            url += f"&filter={filter}"
-
         try:
-            response = self.session.get(url)
-
-            if not response.ok:
-                logger.error(f"Failed to get response from overseerr: {response.data}")
-
+            response = self.request_handler.execute(HttpMethod.GET, f"api/v1/request?take={10000}&filter=approved&sort=added")
+            if not response.is_ok:
+                logger.error(f"Failed to fetch requests from overseerr: {response.data}")
                 return []
-
-            from schemas.overseerr import UserUserIdRequestsGet200Response
-
-            response_data = UserUserIdRequestsGet200Response.from_dict(response.json())
-
-            assert response_data
-
-            if not response_data.results:
-                logger.debug("No user approved requests found from overseerr")
-
-                return []
-
+        except (ConnectionError, RetryError, MaxRetryError) as e:
+            logger.error(f"Failed to fetch requests from overseerr: {str(e)}")
+            return []
         except Exception as e:
-            logger.error(f"Failed to get response from overseerr: {str(e)}")
+            logger.error(f"Unexpected error during fetching requests: {str(e)}")
+            return []
 
+        if not hasattr(response.data, "pageInfo") or getattr(response.data.pageInfo, "results", 0) == 0:
             return []
 
         # Lets look at approved items only that are only in the pending state
-        pending_items = response_data.results
+        pending_items = [
+            item for item in response.data.results
+            if item.status == 2 and item.media.status == 3
+        ]
 
-        if filter_pending_items and filter == "approved":
-            pending_items = [
-                item
-                for item in response_data.results
-                if item.status == 2 and item.media and item.media.status == 3
-            ]
-
-        media_items: list[MediaItem] = []
-
+        media_items = []
         for item in pending_items:
-            tmdb_id = item.media and item.media.tmdb_id
-            tvdb_id = item.media and item.media.tvdb_id
-
-            if tvdb_id is not None:
-                media_items.append(
-                    MediaItem(
-                        {
-                            "tvdb_id": tvdb_id,
-                            "requested_by": service_key,
-                        }
-                    )
-                )
-
+            if not item.media.tmdbId:
+                logger.debug(f"Skipping {item.type} with Overseerr ID {item.media.id} due to missing TMDb ID")
                 continue
-
-            if tmdb_id is not None:
-                media_items.append(
-                    MediaItem(
-                        {
-                            "tmdb_id": tmdb_id,
-                            "requested_by": service_key,
-                        }
-                    )
-                )
-
-                continue
-
-            logger.error(f"Could not determine ID for overseerr item: {item.id}")
-
+            seasons = []
+            for season in getattr(item, "seasons", None) or []:
+                number = getattr(season, "seasonNumber", None)
+                if number is not None:
+                    seasons.append(int(number))
+            media_items.append(MediaItem({
+                "tmdb_id": str(item.media.tmdbId),
+                "imdb_id": getattr(item.media, "imdbId", None),
+                "requested_by": service_key,
+                "overseerr_id": item.media.id,
+                "aliases": {"request": {
+                    "type": "show" if item.type == "tv" else "movie",
+                    "seasons": seasons,
+                }},
+            }))
         return media_items
 
-    def delete_request(self, mediaId: int) -> bool:
-        """Delete request from Overseerr"""
+
+    def get_imdb_id(self, data) -> str | None:
+        """Get imdbId for item from overseerr"""
+        if data.mediaType == "show":
+            external_id = data.tvdbId
+            data.mediaType = "tv"
+        else:
+            external_id = data.tmdbId
 
         try:
-            response = self.session.delete(f"api/v1/request/{mediaId}")
-
-            logger.debug(f"Deleted request {mediaId} from Overseerr")
-
-            return response.ok
+            response = self.request_handler.execute(HttpMethod.GET, f"api/v1/{data.mediaType}/{external_id}?language=en")
+        except (ConnectionError, RetryError, MaxRetryError) as e:
+            logger.error(f"Failed to fetch media details from overseerr: {str(e)}")
+            return None
         except Exception as e:
-            logger.error(f"Failed to delete request from Overseerr: {str(e)}")
+            logger.error(f"Unexpected error during fetching media details: {str(e)}")
+            return None
 
+        if not response.is_ok or not hasattr(response.data, "externalIds"):
+            return None
+
+        imdb_id = getattr(response.data.externalIds, "imdbId", None)
+        if imdb_id:
+            return imdb_id
+
+        # Try alternate IDs if IMDb ID is not available
+        alternate_ids = [("tmdbId", self.trakt_api.get_imdbid_from_tmdb)]
+        for id_attr, fetcher in alternate_ids:
+            external_id_value = getattr(response.data.externalIds, id_attr, None)
+            if external_id_value:
+                _type = data.media_type
+                if _type == "tv":
+                    _type = "show"
+                try:
+                    new_imdb_id: Union[str, None] = fetcher(external_id_value, type=_type)
+                    if not new_imdb_id:
+                        continue
+                    return new_imdb_id
+                except Exception as e:
+                    logger.error(f"Error fetching alternate ID: {str(e)}")
+                    continue
+
+    def delete_request(self, mediaId: int) -> bool:
+        """Delete request from `Overseerr`"""
+        settings = settings_manager.settings.content.overseerr
+        headers = {"X-Api-Key": settings.api_key}
+        try:
+            response = self.request_handler.execute(HttpMethod.DELETE, f"api/v1/request/{mediaId}", headers=headers)
+            logger.debug(f"Deleted request {mediaId} from overseerr")
+            return response.is_ok
+        except Exception as e:
+            logger.error(f"Failed to delete request from overseerr: {str(e)}")
             return False
 
+    def mark_processing(self, mediaId: int) -> bool:
+        """Mark item as processing in overseerr"""
+        try:
+            response = self.request_handler.execute(HttpMethod.POST, f"api/v1/media/{mediaId}/pending", data={"is4k": False})
+            logger.info(f"Marked media {mediaId} as processing in overseerr")
+            return response.is_ok
+        except Exception as e:
+            logger.error(f"Failed to mark media as processing in overseerr with id {mediaId}: {str(e)}")
+            return False
+
+    def mark_partially_available(self, mediaId: int) -> bool:
+        """Mark item as partially available in overseerr"""
+        try:
+            response = self.request_handler.execute(HttpMethod.POST, f"api/v1/media/{mediaId}/partial", data={"is4k": False})
+            logger.info(f"Marked media {mediaId} as partially available in overseerr")
+            return response.is_ok
+        except Exception as e:
+            logger.error(f"Failed to mark media as partially available in overseerr with id {mediaId}: {str(e)}")
+            return False
+
+    def mark_completed(self, mediaId: int) -> bool:
+        """Mark item as completed in overseerr"""
+        try:
+            response = self.request_handler.execute(HttpMethod.POST, f"api/v1/media/{mediaId}/available", data={"is4k": False})
+            logger.info(f"Marked media {mediaId} as completed in overseerr")
+            return response.is_ok
+        except Exception as e:
+            logger.error(f"Failed to mark media as completed in overseerr with id {mediaId}: {str(e)}")
+            return False
 
 # Statuses for Media Requests endpoint /api/v1/request:
 # item.status:

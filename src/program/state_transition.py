@@ -1,148 +1,115 @@
-from typing import Any, Literal
-from kink import di
 from loguru import logger
 
 from program.media import MediaItem, States
+from program.services.downloaders import Downloader
+from program.services.indexers.trakt import TraktIndexer
+from program.services.indexers.tmdb_request import TmdbRequestIndexer
+from program.services.post_processing import PostProcessing, notify
+from program.services.post_processing.subliminal import Subliminal
+from program.services.scrapers import Scraping
+from program.services.updaters import Updater
+from program.settings.manager import settings_manager
+from program.symlink import Symlinker
 from program.types import ProcessedEvent, Service
-from program.media.item import Season, Show
 
 
-def process_event(
-    emitted_by: Service | Literal["StateTransition", "RetryLibrary"] | str,
-    existing_item: MediaItem | None = None,
-    content_item: MediaItem | None = None,
-    overrides: dict[str, Any] | None = None,
-) -> ProcessedEvent:
+def process_event(emitted_by: Service, existing_item: MediaItem | None = None, content_item: MediaItem | None = None) -> ProcessedEvent:
     """Process an event and return the updated item, next service and items to submit."""
-
-    from program.program import Program
-
-    services = di[Program].services
-
-    assert services
-
-    next_service: Service | None = None
-    no_further_processing = ProcessedEvent(
-        service=None,
-        related_media_items=[],
-    )
-    items_to_submit = list[MediaItem]()
+    next_service: Service = None
+    no_further_processing: ProcessedEvent = (None, [])
+    items_to_submit = []
 
     if existing_item and existing_item.last_state in [States.Paused, States.Failed]:
+        # logger.debug(f"Skipping {existing_item.log_string}: Item is {existing_item.last_state.name}. Manual intervention required.")
         return no_further_processing
 
-    if content_item or (existing_item and existing_item.last_state == States.Requested):
-        log_string = None
+    if content_item or (existing_item is not None and existing_item.last_state == States.Requested):
+        # Prefer TMDb for stable IDs supplied by request managers.  The
+        # indexer still accepts legacy IMDb-only requests through /find.
+        next_service = TmdbRequestIndexer
+        request_item = content_item or existing_item
+        request_key = request_item.tmdb_id or request_item.imdb_id or request_item.id
+        logger.debug(f"Next service: {next_service.__name__} for {request_key}")
+        return next_service, [request_item]
 
-        if existing_item:
-            log_string = existing_item.log_string
-        elif content_item:
-            log_string = content_item.log_string
-
-        logger.debug(f"Submitting {log_string} to IndexerService")
-
-        related_media_items = list[MediaItem]()
-
-        if content_item:
-            related_media_items.append(content_item)
-        elif existing_item:
-            related_media_items.append(existing_item)
-
-        return ProcessedEvent(
-            service=services.indexer,
-            related_media_items=related_media_items,
-            overrides=overrides,
-        )
-
-    elif existing_item and existing_item.last_state in [
-        States.PartiallyCompleted,
-        States.Ongoing,
-    ]:
-        if isinstance(existing_item, Show):
-            incomplete_seasons = [
-                s
-                for s in existing_item.seasons
-                if s.last_state not in [States.Completed, States.Unreleased]
-            ]
-
+    elif existing_item is not None and existing_item.last_state in [States.PartiallyCompleted, States.Ongoing]:
+        if existing_item.type == "show":
+            incomplete_seasons = [s for s in existing_item.seasons if s.last_state not in [States.Completed, States.Unreleased]]
+            logger.debug(f"Found {len(incomplete_seasons)} incomplete seasons to process for {existing_item.id}")
             for season in incomplete_seasons:
-                processed_event = process_event(
-                    emitted_by, season, None, overrides
-                )
-
-                if processed_event.related_media_items:
-                    items_to_submit += processed_event.related_media_items
-        elif isinstance(existing_item, Season):
-            incomplete_episodes = [
-                e for e in existing_item.episodes if e.last_state != States.Completed
-            ]
-
+                _, sub_items = process_event(emitted_by, season, None)
+                items_to_submit += sub_items
+        elif existing_item.type == "season":
+            incomplete_episodes = [e for e in existing_item.episodes if e.last_state != States.Completed]
+            logger.debug(f"Found {len(incomplete_episodes)} incomplete episodes to process for {existing_item.id}")
             for episode in incomplete_episodes:
-                processed_event = process_event(
-                    emitted_by, episode, None, overrides
-                )
+                _, sub_items = process_event(emitted_by, episode, None)
+                items_to_submit += sub_items
 
-                if processed_event.related_media_items:
-                    items_to_submit += processed_event.related_media_items
-
-    elif existing_item and existing_item.last_state in [States.Indexed, States.Unknown]:
-        next_service = services.scraping
-
-        if emitted_by != services.scraping and (
-            overrides is not None
-            or services.scraping.should_submit(existing_item)
-        ):
+    elif existing_item is not None and existing_item.last_state == States.Indexed:
+        next_service = Scraping
+        if emitted_by != Scraping and Scraping.should_submit(existing_item):
             items_to_submit = [existing_item]
-        elif isinstance(existing_item, Show):
-            # Decompose Show → Seasons (each season scrapes for packs)
-            items_to_submit = [
-                s
-                for s in existing_item.seasons
-                if s.last_state
-                in [States.Indexed, States.PartiallyCompleted, States.Unknown]
-                and (
-                    overrides is not None
-                    or services.scraping.should_submit(s)
-                )
-            ]
-        elif isinstance(existing_item, Season):
-            # Keep the Season as a unit — the scraper finds both season packs
-            # and individual episodes.  Decomposing to per-episode scraping
-            # here would prevent season-pack matching.
-            if services.scraping.should_submit(existing_item):
-                items_to_submit = [existing_item]
+            logger.debug(f"Next service: {next_service.__name__} for {existing_item.id}")
+        elif existing_item.type == "show":
+            items_to_submit = [s for s in existing_item.seasons if s.last_state in [States.Indexed, States.PartiallyCompleted, States.Unknown] and Scraping.should_submit(s)]
+            if items_to_submit:
+                logger.debug(f"Next service: {next_service.__name__} for {len(items_to_submit)} seasons from {existing_item.id}")
+        elif existing_item.type == "season":
+            items_to_submit = [e for e in existing_item.episodes if e.last_state in [States.Indexed, States.Unknown] and Scraping.should_submit(e)]
+            if items_to_submit:
+                logger.debug(f"Next service: {next_service.__name__} for {len(items_to_submit)} episodes from {existing_item.id}")
 
-    elif existing_item and existing_item.last_state == States.Scraped:
-        next_service = services.downloader
+    elif existing_item is not None and existing_item.last_state == States.Scraped:
+        next_service = Downloader
         items_to_submit = [existing_item]
+        logger.debug(f"Next service: {next_service.__name__} for {existing_item.id}")
 
-    elif existing_item and existing_item.last_state == States.Downloaded:
-        next_service = services.filesystem
+    elif existing_item is not None and existing_item.last_state == States.Downloaded:
+        next_service = Symlinker
         items_to_submit = [existing_item]
+        logger.debug(f"Next service: {next_service.__name__} for {existing_item.id}")
 
-    elif existing_item and existing_item.last_state == States.Symlinked:
-        next_service = services.updater
+    elif existing_item is not None and existing_item.last_state == States.Symlinked:
+        next_service = Updater
         items_to_submit = [existing_item]
+        logger.debug(f"Next service: {next_service.__name__} for {existing_item.id}")
 
-    elif existing_item and existing_item.last_state == States.Completed:
+    elif existing_item is not None and existing_item.last_state == States.Completed:
+        logger.debug(f"Item completed: {existing_item.id}")
+        # If a user manually retries an item, lets not notify them again
+        if emitted_by not in ["RetryItem", PostProcessing]:
+            notify(existing_item)
         # Avoid multiple post-processing runs
-        if emitted_by != services.post_processing:
-            next_service = services.post_processing
-            items_to_submit = [existing_item]
+        if emitted_by != PostProcessing:
+            if settings_manager.settings.post_processing.subliminal.enabled:
+                next_service = PostProcessing
+                if existing_item.type in ["movie", "episode"] and Subliminal.should_submit(existing_item):
+                    items_to_submit = [existing_item]
+                    logger.debug(f"Next service: {next_service.__name__} for {existing_item.id}")
+                elif existing_item.type == "show":
+                    items_to_submit = [e for s in existing_item.seasons for e in s.episodes if e.last_state == States.Completed and Subliminal.should_submit(e)]
+                    if items_to_submit:
+                        logger.debug(f"Next service: {next_service.__name__} for {len(items_to_submit)} episodes from {existing_item.id}")
+                elif existing_item.type == "season":
+                    items_to_submit = [e for e in existing_item.episodes if e.last_state == States.Completed and Subliminal.should_submit(e)]
+                    if items_to_submit:
+                        logger.debug(f"Next service: {next_service.__name__} for {len(items_to_submit)} episodes from {existing_item.id}")
+                if not items_to_submit:
+                    logger.debug(f"No post-processing needed for {existing_item.id}")
+                    return no_further_processing
         else:
+            logger.debug(f"Post-processing already completed for {existing_item.id}")
             return no_further_processing
 
-    if items_to_submit:
-        service_name = (
-            next_service.__class__.__name__ if next_service else "StateTransition"
-        )
+    # Log the final result of state transition
+    if not next_service and not items_to_submit:
+        if existing_item:
+            logger.debug(f"No further processing needed for {existing_item.id} (State: {existing_item.last_state.name})")
+        else:
+            logger.debug(f"No further processing needed")
+    elif items_to_submit:
+        service_name = next_service.__name__ if next_service else "StateTransition"
+        logger.debug(f"State transition complete: {len(items_to_submit)} items queued for {service_name}")
 
-        logger.debug(
-            f"State transition complete: {len(items_to_submit)} items queued for {service_name}"
-        )
-
-    return ProcessedEvent(
-        service=next_service,
-        related_media_items=items_to_submit,
-        overrides=overrides,
-    )
+    return next_service, items_to_submit

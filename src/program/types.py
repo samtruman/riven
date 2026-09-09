@@ -1,7 +1,6 @@
-from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal
+from typing import Generator, Optional, Union
 
 from program.media.item import MediaItem
 from program.services.content import (
@@ -11,52 +10,49 @@ from program.services.content import (
     PlexWatchlist,
     TraktContent,
 )
-from program.services.downloaders import Downloader
-from program.services.scrapers import Scraping
-from program.services.updaters import Updater
-from program.services.filesystem import FilesystemService
-from program.media.state import States
-from program.services.indexers import IndexerService
-from program.services.post_processing import PostProcessing
-
-
-# Type aliases for various service types
-Scraper = Scraping
-Content = Overseerr | PlexWatchlist | Listrr | Mdblist | TraktContent
-Service = (
-    Content
-    | Scraper
-    | FilesystemService
-    | Updater
-    | IndexerService
-    | PostProcessing
-    | Downloader
+from program.services.downloaders import (
+    RealDebridDownloader,
+    AllDebridDownloader,
+    TorBoxDownloader,
 )
 
+from program.services.libraries import SymlinkLibrary
+from program.services.scrapers import (
+    Comet,
+    Jackett,
+    Knightcrawler,
+    Mediafusion,
+    Orionoid,
+    Scraping,
+    Torrentio,
+    Zilean,
+)
+from program.services.updaters import Updater
+from program.symlink import Symlinker
 
-@dataclass
+# Typehint classes
+Scraper = Union[Scraping, Torrentio, Knightcrawler, Mediafusion, Orionoid, Jackett, Zilean, Comet]
+Content = Union[Overseerr, PlexWatchlist, Listrr, Mdblist, TraktContent]
+Downloader = Union[
+    RealDebridDownloader,
+    AllDebridDownloader,
+    TorBoxDownloader,
+]
+
+Service = Union[Content, SymlinkLibrary, Scraper, Downloader, Symlinker, Updater]
+MediaItemGenerator = Generator[MediaItem, None, MediaItem | None]
+
 class ProcessedEvent:
-    service: Service | None
-    related_media_items: Sequence[MediaItem] | None
-    overrides: dict[str, Any] | None = None
-
+    service: Service
+    related_media_items: list[MediaItem]
 
 @dataclass
 class Event:
-    emitted_by: Service | Literal["StateTransition", "RetryLibrary"] | str
-    item_id: int | None = None
-    content_item: "MediaItem | None" = None
+    emitted_by: Service
+    item_id: Optional[str] = None
+    content_item: Optional[MediaItem] = None
     run_at: datetime = datetime.now()
-    item_state: States | None = None  # Cached state for priority sorting
-    overrides: dict[str, Any] | None = None
 
     @property
-    def log_message(self) -> str:
-        """Human-friendly description of the event target for logging."""
-
-        if self.content_item:
-            return self.content_item.log_string
-        elif self.item_id:
-            return f"Item ID {self.item_id}"
-
-        return "Unknown Event"
+    def log_message(self):
+        return f"Item ID {self.item_id}" if self.item_id else f"External ID {self.content_item.tmdb_id or self.content_item.imdb_id}"

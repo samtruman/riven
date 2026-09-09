@@ -1,11 +1,14 @@
-from kink import di
-from pydantic import BaseModel
-from fastapi import APIRouter, Request
-from loguru import logger
+from typing import Any, Dict
 
+import pydantic
+from fastapi import APIRouter, Request
+from kink import di
+from loguru import logger
+from requests import RequestException
+
+from program.apis.trakt_api import TraktAPI
 from program.media.item import MediaItem
 from program.services.content.overseerr import Overseerr
-from program.program import Program
 
 from ..models.overseerr import OverseerrWebhook
 
@@ -15,87 +18,55 @@ router = APIRouter(
 )
 
 
-class OverseerrWebhookResponse(BaseModel):
-    success: bool
-    message: str | None = None
-
-
-@router.post(
-    "/overseerr",
-    response_model=OverseerrWebhookResponse,
-)
-async def overseerr(request: Request) -> OverseerrWebhookResponse:
+@router.post("/overseerr")
+async def overseerr(request: Request) -> Dict[str, Any]:
     """Webhook for Overseerr"""
-
     try:
         response = await request.json()
-
         if response.get("subject") == "Test Notification":
-            logger.log(
-                "API", "Received test notification, Overseerr configured properly"
-            )
-
-            return OverseerrWebhookResponse(
-                success=True,
-            )
-
+            logger.log("API", "Received test notification, Overseerr configured properly")
+            return {"success": True}
         req = OverseerrWebhook.model_validate(response)
-
-        if services := di[Program].services:
-            overseerr = services.overseerr
-        else:
-            logger.error("Overseerr not initialized yet")
-            return OverseerrWebhookResponse(
-                success=False,
-                message="Overseerr not initialized",
-            )
-
-        if not overseerr.initialized:
-            logger.error("Overseerr not initialized")
-
-            return OverseerrWebhookResponse(
-                success=False,
-                message="Overseerr not initialized",
-            )
-
-        item_type = req.media.media_type
-
-        new_item = None
-
-        if item_type == "movie":
-            new_item = MediaItem(
-                {
-                    "tmdb_id": req.media.tmdbId,
-                    "requested_by": "overseerr",
-                    "overseerr_id": req.request.request_id if req.request else None,
-                }
-            )
-        elif item_type == "tv":
-            new_item = MediaItem(
-                {
-                    "tvdb_id": req.media.tvdbId,
-                    "requested_by": "overseerr",
-                    "overseerr_id": req.request.request_id if req.request else None,
-                }
-            )
-
-        if not new_item:
-            logger.error(
-                f"Failed to create new item: TMDB ID {req.media.tmdbId}, TVDB ID {req.media.tvdbId}"
-            )
-
-            return OverseerrWebhookResponse(
-                success=False,
-                message="Failed to create new item",
-            )
-
-        di[Program].em.add_item(
-            new_item,
-            service=Overseerr.__class__.__name__,
-        )
-
-        return OverseerrWebhookResponse(success=True)
-    except Exception as e:
+    except (Exception, pydantic.ValidationError) as e:
         logger.error(f"Failed to process request: {e}")
+        return {"success": False, "message": str(e)}
 
-        return OverseerrWebhookResponse(success=False)
+    if not req.media.tmdbId:
+        logger.error("Overseerr-compatible webhook has no TMDb ID")
+        return {"success": False, "message": "Missing TMDb ID"}
+
+    overseerr: Overseerr = request.app.program.all_services[Overseerr]
+    if not overseerr.initialized:
+        logger.error("Overseerr not initialized")
+        return {"success": False, "message": "Overseerr not initialized"}
+
+    request_id = req.request.request_id if req.request else None
+    new_item = MediaItem({
+        "tmdb_id": str(req.media.tmdbId),
+        "imdb_id": req.media.imdbId,
+        "requested_by": "overseerr",
+        "overseerr_id": int(request_id) if request_id and str(request_id).isdigit() else None,
+        "aliases": {"request": {
+            "type": "show" if req.media.media_type == "tv" else "movie",
+            "seasons": req.requested_seasons or [],
+        }},
+    })
+    request.app.program.em.add_item(new_item, service="Overseerr")
+    return {"success": True}
+
+
+def get_imdbid_from_overseerr(req: OverseerrWebhook) -> str:
+    """Get the imdb_id from the Overseerr webhook"""
+    imdb_id = req.media.imdbId
+    trakt_api = di[TraktAPI]
+    if not imdb_id:
+        try:
+            _type = req.media.media_type
+            if _type == "tv":
+                _type = "show"
+            imdb_id = trakt_api.get_imdbid_from_tmdb(str(req.media.tmdbId), type=_type)
+            if not imdb_id or not imdb_id.startswith("tt"):
+                imdb_id = trakt_api.get_imdbid_from_tvdb(str(req.media.tvdbId), type=_type)
+        except RequestException:
+            pass
+    return imdb_id
